@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dithered Data Streams (S-Curve)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050505;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas {
+            display: block;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.5);
+            pointer-events: none;
+            z-index: 10;
+        }
+        .digital-label {
+            position: absolute;
+            color: #fff;
+            font-weight: bold;
+            text-shadow: 0 0 10px currentColor;
+            opacity: 0.9;
+            font-size: 16px;
+            transform: translate(-50%, -50%);
+            white-space: nowrap;
+            pointer-events: auto;
+            cursor: grab;
+            user-select: none;
+            padding: 10px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 4px;
+            transition: color 0.2s, background 0.2s;
+        }
+        .digital-label:active {
+            cursor: grabbing;
+            background: rgba(255,255,255,0.1);
+        }
+    </style>
+    
+    <!-- Import Map for modern Three.js Module loading -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    
+    <!-- External Utilities (GUI and GSAP) -->
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+</head>
+<body>
+
+    <div id="ui">
+        
+    </div>
+
+    <div id="label-container"></div>
+
+    <!-- Main Application Script -->
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+        // --- SYMBOL DITHER SHADER ---
+        const SymbolShader = {
+            uniforms: {
+                'tDiffuse': { value: null },
+                'tSize':    { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                'scale':    { value: 3.0 },
+                'colored':  { value: 1 }    // 0 = BW, 1 = Color
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform vec2 tSize;
+                uniform float scale;
+                uniform int colored;
+                varying vec2 vUv;
+
+                void main() {
+                    // 1. Grid Cell Calculation
+                    vec2 pixelCoord = vUv * tSize / scale;
+                    vec2 cellCoord = floor(pixelCoord);
+                    vec2 localCoord = fract(pixelCoord); // 0.0 to 1.0 inside the cell
+
+                    // 2. Sample Center
+                    vec2 sampleUv = (cellCoord + 0.5) * scale / tSize;
+                    vec4 color = texture2D(tDiffuse, sampleUv);
+                    float brightness = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+
+                    // 3. Dynamic Thickness Logic
+                    float thickness = clamp(1.0 / scale, 0.05, 0.45); 
+                    
+                    float symbol = 0.0;
+                    float distX = abs(localCoord.x - 0.5); 
+                    float distY = abs(localCoord.y - 0.5); 
+                    
+                    // Shapes
+                    bool isMinus = (distY < thickness) && (distX < 0.4); 
+                    bool isPlus = ((distY < thickness) && (distX < 0.4)) || ((distX < thickness) && (distY < 0.4));
+
+                    // 4. Thresholds
+                    if (brightness > 0.4) {
+                        symbol = isPlus ? 1.0 : 0.0;
+                    } else if (brightness > 0.05) {
+                        symbol = isMinus ? 1.0 : 0.0;
+                    }
+
+                    // 5. Output
+                    vec3 finalColor;
+                    if (colored == 1) {
+                        finalColor = color.rgb * symbol;
+                    } else {
+                        finalColor = vec3(symbol);
+                    }
+                    
+                    gl_FragColor = vec4(finalColor, 1.0);
+                }
+            `
+        };
+
+        // --- CONFIGURATION ---
+        const CONFIG = {
+            lineCount: 150,
+            segmentCount: 60,
+            interactionRadius: 4.0,
+            interactionForce: 0.15,
+            springStiffness: 0.06,
+            springDamping: 0.5,
+            waveSpeed: 0.0082,
+            waveAmplitude: 1.754,
+            dragBendMultiplier: -8.0,
+            dragBendSmoothness: 0.1,
+            curveTension: 0.6,
+            
+            // Spread Control
+            spreadStart: 1.2,
+            spreadMid: 0.5,
+            spreadEnd: 0.0,
+            
+            // Post Processing Settings
+            ditherEnabled: true,
+            ditherScale: 3.0,
+            ditherColor: true,
+            
+            bundles: [
+                { yOffset: 12.5, colorStart: new THREE.Color(0x0022ff), colorEnd: new THREE.Color(0x00ffff), label: "000 101 1011" },
+                { yOffset: 7.5, colorStart: new THREE.Color(0x8800ff), colorEnd: new THREE.Color(0xff00aa), label: "100 000 110" },
+                { yOffset: 2.5, colorStart: new THREE.Color(0xff4400), colorEnd: new THREE.Color(0xffdd00), label: "010 001 000" },
+                { yOffset: -2.5, colorStart: new THREE.Color(0x00ff44), colorEnd: new THREE.Color(0xccff00), label: "111 010 101" },
+                { yOffset: -7.5, colorStart: new THREE.Color(0xff0000), colorEnd: new THREE.Color(0xff8888), label: "101 000 001" },
+                { yOffset: -12.5, colorStart: new THREE.Color(0x0088ff), colorEnd: new THREE.Color(0xffffff), label: "000 000 000" }
+            ]
+        };
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x050505, 0.03);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 20; 
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true }); 
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // --- POST PROCESSING SETUP ---
+        const composer = new EffectComposer(renderer);
+        
+        // 1. Render Pass
+        const renderPass = new RenderPass(scene, camera);
+        composer.addPass(renderPass);
+
+        // 2. Symbol/Dither Pass
+        const ditherPass = new ShaderPass(SymbolShader);
+        ditherPass.uniforms.tSize.value.set(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
+        ditherPass.uniforms.scale.value = CONFIG.ditherScale;
+        composer.addPass(ditherPass);
+
+        // --- INTERACTION STATE ---
+        const mouse = new THREE.Vector2(9999, 9999);
+        const raycaster = new THREE.Raycaster();
+        const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+        const mouse3D = new THREE.Vector3();
+        const lastMouse3D = new THREE.Vector3();
+        const mouseVelocity = new THREE.Vector3();
+        let activeBundle = null; 
+        const dragOffset = new THREE.Vector3(); 
+
+        // --- FIBER BUNDLE CLASS ---
+        const bundles = [];
+
+        class FiberBundle {
+            constructor(config) {
+                this.group = new THREE.Group();
+                this.lines = [];
+                this.randomOffsets = [];
+                this.config = config;
+                this.targetPosition = new THREE.Vector3(6, config.yOffset, 0);
+                this.lastTargetY = this.targetPosition.y;
+                this.currentBend = 0;
+
+                const material = new THREE.LineBasicMaterial({
+                    vertexColors: true,
+                    blending: THREE.AdditiveBlending,
+                    depthTest: false,
+                    transparent: true,
+                    opacity: 0.6
+                });
+
+                for (let i = 0; i < CONFIG.lineCount; i++) {
+                    const geometry = new THREE.BufferGeometry();
+                    const positions = [];
+                    const colors = [];
+                    
+                    const spreadFactorY = (Math.random() - 0.5) * 8; 
+                    const spreadFactorZ = (Math.random() - 0.5) * 6;
+                    
+                    const phase = Math.random() * Math.PI * 2;
+                    const speed = 0.5 + Math.random();
+
+                    const lineProps = {
+                        spreadFactorY,
+                        spreadFactorZ,
+                        phase,
+                        speed,
+                        velocities: new Float32Array(CONFIG.segmentCount * 3).fill(0),
+                        offsets: new Float32Array(CONFIG.segmentCount * 3).fill(0)
+                    };
+                    this.randomOffsets.push(lineProps);
+
+                    for (let j = 0; j < CONFIG.segmentCount; j++) {
+                        positions.push(0, 0, 0);
+                        const t = j / (CONFIG.segmentCount - 1);
+                        const r = THREE.MathUtils.lerp(config.colorStart.r, config.colorEnd.r, t);
+                        const g = THREE.MathUtils.lerp(config.colorStart.g, config.colorEnd.g, t);
+                        const b = THREE.MathUtils.lerp(config.colorStart.b, config.colorEnd.b, t);
+                        colors.push(r, g, b);
+                    }
+
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+                    const line = new THREE.Line(geometry, material);
+                    this.lines.push(line);
+                    this.group.add(line);
+                }
+
+                scene.add(this.group);
+                this.addTipGlow();
+                this.addLabel();
+            }
+
+            addTipGlow() {
+                const canvas = document.createElement('canvas');
+                canvas.width = 32;
+                canvas.height = 32;
+                const context = canvas.getContext('2d');
+                const gradient = context.createRadialGradient(16, 16, 0, 16, 16, 16);
+                const c = this.config.colorEnd;
+                gradient.addColorStop(0, `rgba(${c.r*255}, ${c.g*255}, ${c.b*255}, 1)`);
+                gradient.addColorStop(1, `rgba(0,0,0,0)`);
+                context.fillStyle = gradient;
+                context.fillRect(0, 0, 32, 32);
+
+                const texture = new THREE.CanvasTexture(canvas);
+                const spriteMaterial = new THREE.SpriteMaterial({ 
+                    map: texture, 
+                    color: 0xffffff, 
+                    blending: THREE.AdditiveBlending 
+                });
+                const sprite = new THREE.Sprite(spriteMaterial);
+                sprite.scale.set(2, 2, 1);
+                this.group.add(sprite);
+                this.tipSprite = sprite;
+            }
+
+            addLabel() {
+                const div = document.createElement('div');
+                div.className = 'digital-label';
+                div.textContent = this.config.label;
+                div.style.color = `#${this.config.colorEnd.getHexString()}`;
+                
+                div.addEventListener('mousedown', (e) => {
+                    activeBundle = this;
+                    raycaster.setFromCamera(mouse, camera);
+                    const intersect = new THREE.Vector3();
+                    raycaster.ray.intersectPlane(plane, intersect);
+                    dragOffset.subVectors(this.targetPosition, intersect);
+                    gsap.killTweensOf(this.targetPosition);
+                });
+
+                document.getElementById('label-container').appendChild(div);
+                this.labelElement = div;
+            }
+
+            dispose() {
+                scene.remove(this.group);
+                this.lines.forEach(line => line.geometry.dispose());
+                if(this.tipSprite) {
+                    this.tipSprite.material.dispose();
+                    this.tipSprite.material.map.dispose();
+                }
+                if (this.labelElement && this.labelElement.parentNode) {
+                    this.labelElement.parentNode.removeChild(this.labelElement);
+                }
+            }
+
+            update(mouseVel, time) {
+                if(this.tipSprite) {
+                    this.tipSprite.position.copy(this.targetPosition);
+                }
+
+                // Physics: Drag Bend Calculation
+                const deltaY = this.targetPosition.y - this.lastTargetY;
+                this.lastTargetY = this.targetPosition.y;
+
+                const targetBend = deltaY * CONFIG.dragBendMultiplier;
+                this.currentBend += (targetBend - this.currentBend) * CONFIG.dragBendSmoothness;
+
+                // Geometry Setup
+                const vFOV = camera.fov * Math.PI / 180;
+                const height = 2 * Math.tan(vFOV / 2) * camera.position.z;
+                const width = height * camera.aspect;
+                const startX = -width / 2;
+
+                // --- BEZIER CONTROL POINTS SETUP ---
+                // P0: Start (Left)
+                const p0 = { x: startX, y: 0, z: 0 };
+                // P3: End (Right / Target)
+                const p3 = { x: this.targetPosition.x, y: this.targetPosition.y, z: this.targetPosition.z };
+                
+                // Calculate distance for control point positioning
+                const dist = p3.x - p0.x;
+                const ctrlDist = dist * CONFIG.curveTension;
+
+                // P1: Control Point 1 (Right from start)
+                const p1 = { x: p0.x + ctrlDist, y: p0.y, z: p0.z };
+                // P2: Control Point 2 (Left from target)
+                const p2 = { x: p3.x - ctrlDist, y: p3.y, z: p3.z };
+
+                this.lines.forEach((line, index) => {
+                    const positions = line.geometry.attributes.position.array;
+                    const props = this.randomOffsets[index];
+
+                    for (let j = 0; j < CONFIG.segmentCount; j++) {
+                        const t = j / (CONFIG.segmentCount - 1); 
+                        const idx = j * 3;
+
+                        // --- CUBIC BEZIER CALCULATION ---
+                        // B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+                        const oneMinusT = 1 - t;
+                        const t2 = t * t;
+                        const t3 = t2 * t;
+                        const oneMinusT2 = oneMinusT * oneMinusT;
+                        const oneMinusT3 = oneMinusT2 * oneMinusT;
+
+                        // Basis functions
+                        const b0 = oneMinusT3;
+                        const b1 = 3 * oneMinusT2 * t;
+                        const b2 = 3 * oneMinusT * t2;
+                        const b3 = t3;
+
+                        // Calculate Backbone position (S-Curve)
+                        const bx = b0*p0.x + b1*p1.x + b2*p2.x + b3*p3.x;
+                        const by = b0*p0.y + b1*p1.y + b2*p2.y + b3*p3.y;
+                        const bz = b0*p0.z + b1*p1.z + b2*p2.z + b3*p3.z;
+                        
+                        // --- SPREAD ENVELOPE CALCULATION ---
+                        let spreadEnvelope;
+                        if (t <= 0.5) {
+                            // Interpolate from Start to Mid
+                            spreadEnvelope = THREE.MathUtils.lerp(CONFIG.spreadStart, CONFIG.spreadMid, t * 2.0);
+                        } else {
+                            // Interpolate from Mid to End
+                            spreadEnvelope = THREE.MathUtils.lerp(CONFIG.spreadMid, CONFIG.spreadEnd, (t - 0.5) * 2.0);
+                        }
+
+                        const spreadY = props.spreadFactorY * spreadEnvelope;
+                        const spreadZ = props.spreadFactorZ * spreadEnvelope;
+                        
+                        const waveX = (j * 0.2) + (time * props.speed * CONFIG.waveSpeed) + props.phase;
+                        // Use spreadEnvelope for wave amplitude dampening as well, or keep funnelFactor?
+                        // Let's use the new spreadEnvelope for consistency so waves die out where fibers are thin.
+                        const waveYOffset = Math.sin(waveX) * CONFIG.waveAmplitude * spreadEnvelope;
+                        
+                        // Physics Bend (Sine based, additive to the S-Curve)
+                        const bendYOffset = Math.sin(t * Math.PI) * this.currentBend;
+
+                        // Combine
+                        const currentX = bx + props.offsets[idx];
+                        const currentY = by + spreadY + waveYOffset + bendYOffset + props.offsets[idx+1];
+                        const currentZ = bz + spreadZ + props.offsets[idx+2];
+                        
+                        // Mouse Interaction (unchanged)
+                        const dx = currentX - mouse3D.x;
+                        const dy = currentY - mouse3D.y;
+                        const distSq = dx*dx + dy*dy;
+
+                        if (!activeBundle && distSq < CONFIG.interactionRadius * CONFIG.interactionRadius) {
+                            const dist = Math.sqrt(distSq);
+                            const influence = (1 - dist / CONFIG.interactionRadius);
+                            const constraint = (1 - t);
+                            props.velocities[idx] += mouseVel.x * influence * CONFIG.interactionForce * constraint;
+                            props.velocities[idx+1] += mouseVel.y * influence * CONFIG.interactionForce * constraint;
+                            props.velocities[idx+2] += mouseVel.z * influence * CONFIG.interactionForce * constraint;
+                        }
+
+                        // Spring Physics Integration
+                        const fx = -props.offsets[idx] * CONFIG.springStiffness;
+                        const fy = -props.offsets[idx+1] * CONFIG.springStiffness;
+                        const fz = -props.offsets[idx+2] * CONFIG.springStiffness;
+
+                        props.velocities[idx] += fx;
+                        props.velocities[idx+1] += fy;
+                        props.velocities[idx+2] += fz;
+
+                        props.velocities[idx] *= CONFIG.springDamping;
+                        props.velocities[idx+1] *= CONFIG.springDamping;
+                        props.velocities[idx+2] *= CONFIG.springDamping;
+
+                        props.offsets[idx] += props.velocities[idx];
+                        props.offsets[idx+1] += props.velocities[idx+1];
+                        props.offsets[idx+2] += props.velocities[idx+2];
+
+                        positions[idx] = currentX;
+                        positions[idx + 1] = currentY;
+                        positions[idx + 2] = currentZ;
+                    }
+                    line.geometry.attributes.position.needsUpdate = true;
+                });
+
+                if(this.tipSprite) {
+                    const vector = this.tipSprite.position.clone();
+                    vector.project(camera);
+                    
+                    const x = (vector.x * 0.5 + 0.5) * window.innerWidth;
+                    const y = (-(vector.y * 0.5) + 0.5) * window.innerHeight;
+                    
+                    this.labelElement.style.left = `${x + 30}px`; 
+                    this.labelElement.style.top = `${y}px`;
+                }
+            }
+        }
+
+        function generateBundles() {
+            bundles.forEach(b => b.dispose());
+            bundles.length = 0;
+            CONFIG.bundles.forEach(conf => bundles.push(new FiberBundle(conf)));
+        }
+
+        generateBundles();
+
+        // --- GUI CONTROLS ---
+        const gui = new lil.GUI({ title: 'Settings' });
+        
+        // POST PROCESSING FOLDER
+        const folderPost = gui.addFolder('ASCII / Dither');
+        folderPost.add(CONFIG, 'ditherEnabled').name('Enable Effect').onChange(v => {
+            ditherPass.enabled = v;
+        });
+        folderPost.add(CONFIG, 'ditherScale', 1.0, 20.0, 1.0).name('Symbol Size').onChange(v => {
+            ditherPass.uniforms.scale.value = v;
+        });
+        folderPost.add(CONFIG, 'ditherColor').name('Color Mode').onChange(v => {
+            ditherPass.uniforms.colored.value = v ? 1 : 0;
+        });
+
+        const folderPhysics = gui.addFolder('Global Physics');
+        folderPhysics.add(CONFIG, 'curveTension', 0.1, 1.0).name('Curve Tension');
+        folderPhysics.add(CONFIG, 'interactionForce', 0.1, 5.0).name('Drag Strength');
+        folderPhysics.add(CONFIG, 'interactionRadius', 1.0, 10.0).name('Mouse Radius');
+        folderPhysics.add(CONFIG, 'springStiffness', 0.01, 0.2).name('Spring Tension');
+        folderPhysics.add(CONFIG, 'springDamping', 0.10, 0.99).name('Damping');
+        folderPhysics.add(CONFIG, 'waveSpeed', 0.0, 0.2).name('Wave Speed');
+        folderPhysics.add(CONFIG, 'waveAmplitude', 0.0, 2.0).name('Wave Height');
+        folderPhysics.add(CONFIG, 'dragBendMultiplier', -20, 20).name('Drag Bend Force');
+
+        const folderGeo = gui.addFolder('Bundle Spread');
+        folderGeo.add(CONFIG, 'spreadStart', 0.0, 5.0).name('Left Spread');
+        folderGeo.add(CONFIG, 'spreadMid', 0.0, 5.0).name('Middle Spread');
+        folderGeo.add(CONFIG, 'spreadEnd', 0.0, 5.0).name('Right Spread');
+        folderGeo.add(CONFIG, 'lineCount', 5, 200, 1).name('Line Count').onChange(generateBundles);
+        
+        const folderColors = gui.addFolder('Bundle Colors');
+        
+        CONFIG.bundles.forEach((conf, index) => {
+            const folder = folderColors.addFolder(`Bundle ${index + 1}`);
+            const params = {
+                start: conf.colorStart.getHex(),
+                end: conf.colorEnd.getHex()
+            };
+            folder.addColor(params, 'start').name('Start Color').onChange(val => {
+                conf.colorStart.setHex(val);
+                generateBundles(); 
+            });
+            folder.addColor(params, 'end').name('End Color').onChange(val => {
+                conf.colorEnd.setHex(val);
+                generateBundles(); 
+            });
+        });
+
+        // --- EVENTS ---
+
+        document.addEventListener('mousemove', (event) => {
+            event.preventDefault();
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            raycaster.ray.intersectPlane(plane, mouse3D);
+
+            if (activeBundle) {
+                const targetPoint = new THREE.Vector3().copy(mouse3D).add(dragOffset);
+                gsap.to(activeBundle.targetPosition, {
+                    x: targetPoint.x, y: targetPoint.y, z: 0,
+                    duration: 1.2, ease: "elastic.out(1, 0.3)", overwrite: "auto"
+                });
+            }
+        });
+
+        document.addEventListener('mouseup', () => { activeBundle = null; });
+        
+        // Touch events
+        document.addEventListener('touchmove', (event) => {
+           if(event.touches.length > 0){
+                event.preventDefault();
+                mouse.x = (event.touches[0].clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.touches[0].clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                raycaster.ray.intersectPlane(plane, mouse3D);
+
+                if (activeBundle) {
+                    const targetPoint = new THREE.Vector3().copy(mouse3D).add(dragOffset);
+                    gsap.to(activeBundle.targetPosition, {
+                        x: targetPoint.x, y: targetPoint.y, z: 0,
+                        duration: 1.2, ease: "elastic.out(1, 0.3)", overwrite: "auto"
+                    });
+                }
+           }
+        }, {passive: false});
+        document.addEventListener('touchend', () => { activeBundle = null; });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            // Update Composer Scale
+            composer.setSize(window.innerWidth, window.innerHeight);
+            ditherPass.uniforms.tSize.value.set(window.innerWidth * window.devicePixelRatio, window.innerHeight * window.devicePixelRatio);
+        });
+
+        let time = 0;
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 1;
+            mouseVelocity.copy(mouse3D).sub(lastMouse3D);
+            if (mouseVelocity.lengthSq() > 10) mouseVelocity.set(0,0,0);
+            bundles.forEach(bundle => bundle.update(mouseVelocity, time));
+            lastMouse3D.copy(mouse3D);
+            
+            // IMPORTANT: Render via Composer, not Renderer
+            composer.render();
+        }
+
+        animate();
+
+    </script>
+</body>
+</html>

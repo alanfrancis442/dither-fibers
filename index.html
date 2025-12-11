@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VI Shader Visualizations</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #050505;
+            font-family: 'Courier New', monospace;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            color: #00ffff;
+            opacity: 0.9;
+        }
+
+        .menu {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .menu a {
+            display: inline-block;
+            padding: 15px 40px;
+            background: rgba(0, 255, 255, 0.1);
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            text-decoration: none;
+            border-radius: 5px;
+            font-size: 1.1em;
+            transition: all 0.3s ease;
+            font-weight: bold;
+            min-width: 300px;
+        }
+
+        .menu a:hover {
+            background: rgba(0, 255, 255, 0.2);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.5);
+            transform: scale(1.05);
+        }
+
+        .menu a:active {
+            transform: scale(0.98);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>VI VISUALIZATIONS</h1>
+        <div class="menu">
+            <a onclick="window.location.href='./s-curve-streams.html'; return false;">S-Curve Streams</a>
+            <a onclick="window.location.href='./fiber-bundles.html'; return false;">Fiber Bundles</a>
+            <a onclick="window.location.href='./dithered-symbols.html'; return false;">Dithered Symbols</a>
+        </div>
+    </div>
+</body>
+</html>
